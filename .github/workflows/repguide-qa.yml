@@ -1,0 +1,142 @@
+name: RepGuide QA
+on:
+  push:
+    branches: [repguide-qa-20260819]
+  workflow_dispatch:
+
+jobs:
+  qa:
+    runs-on: ubuntu-latest
+    services:
+      mongo:
+        image: mongo:8
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.runCommand({ ping: 1 })'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Rebuild archives
+        run: |
+          cat qa/frontend.part* | base64 -d > repguide-frontend.zip
+          cat qa/backend.part* | base64 -d > repguide-backend.zip
+          unzip -t repguide-frontend.zip
+          unzip -t repguide-backend.zip
+      - name: Extract projects
+        run: |
+          mkdir -p frontend backend
+          unzip -q repguide-frontend.zip -d frontend
+          unzip -q repguide-backend.zip -d backend
+          if [ -d frontend/gym-guide-frontend ]; then shopt -s dotglob && mv frontend/gym-guide-frontend/* frontend/ && rmdir frontend/gym-guide-frontend; fi
+          if [ -d backend/gym-guide-backend ]; then shopt -s dotglob && mv backend/gym-guide-backend/* backend/ && rmdir backend/gym-guide-backend; fi
+      - name: Install frontend
+        working-directory: frontend
+        run: npm install
+      - name: Frontend typecheck
+        working-directory: frontend
+        run: npm run typecheck
+      - name: Frontend lint
+        working-directory: frontend
+        run: npm run lint
+      - name: Frontend build
+        working-directory: frontend
+        env:
+          NEXT_PUBLIC_API_URL: http://127.0.0.1:4000/api
+        run: npm run build
+      - name: Install backend
+        working-directory: backend
+        run: npm install
+      - name: Backend tests
+        working-directory: backend
+        run: npm test -- --runInBand
+      - name: Backend build
+        working-directory: backend
+        run: npm run build
+      - name: Seed database
+        working-directory: backend
+        env:
+          MONGODB_URI: mongodb://127.0.0.1:27017/repguide
+          JWT_SECRET: qa-secret-that-is-at-least-32-characters-long
+          APP_URL: http://127.0.0.1:4000
+          ADMIN_EMAIL: admin@repguide.local
+          ADMIN_PASSWORD: Admin123!
+        run: npm run seed
+      - name: Start backend
+        working-directory: backend
+        env:
+          PORT: 4000
+          MONGODB_URI: mongodb://127.0.0.1:27017/repguide
+          JWT_SECRET: qa-secret-that-is-at-least-32-characters-long
+          APP_URL: http://127.0.0.1:4000
+          CORS_ORIGINS: http://127.0.0.1:3000,http://localhost:3000
+        run: |
+          nohup npm run start:prod > /tmp/backend.log 2>&1 &
+          for i in {1..30}; do curl -fsS http://127.0.0.1:4000/api >/dev/null && break; sleep 1; done
+          curl -fsS http://127.0.0.1:4000/api
+      - name: API smoke tests
+        run: |
+          set -euo pipefail
+          curl -fsS http://127.0.0.1:4000/api/categories | tee /tmp/categories.json
+          curl -fsS 'http://127.0.0.1:4000/api/exercises?type=gym&limit=24' | tee /tmp/exercises.json
+          node - <<'NODE'
+          const fs = require('fs');
+          const cats = JSON.parse(fs.readFileSync('/tmp/categories.json','utf8'));
+          const ex = JSON.parse(fs.readFileSync('/tmp/exercises.json','utf8'));
+          if (!Array.isArray(cats) || cats.length !== 7) throw new Error(`Expected 7 categories, got ${cats.length}`);
+          if (!ex.items || ex.items.length !== 14 || ex.total !== 14) throw new Error(`Expected 14 exercises, got ${ex.total}`);
+          NODE
+          curl -fsS 'http://127.0.0.1:4000/api/exercises?q=chest&type=gym' | grep -q 'Bench Press'
+          TOKEN=$(curl -fsS -X POST http://127.0.0.1:4000/api/auth/login -H 'content-type: application/json' -d '{"email":"admin@repguide.local","password":"Admin123!"}' | node -pe 'JSON.parse(fs.readFileSync(0,"utf8")).accessToken')
+          test -n "$TOKEN"
+          curl -fsS http://127.0.0.1:4000/api/admin/stats -H "authorization: Bearer $TOKEN" | tee /tmp/stats.json
+      - name: Start frontend
+        working-directory: frontend
+        env:
+          NEXT_PUBLIC_API_URL: http://127.0.0.1:4000/api
+        run: |
+          nohup npm start > /tmp/frontend.log 2>&1 &
+          for i in {1..30}; do curl -fsS http://127.0.0.1:3000 >/dev/null && break; sleep 1; done
+          curl -fsS http://127.0.0.1:3000 >/dev/null
+      - name: Browser E2E
+        run: |
+          mkdir -p /tmp/browser && cd /tmp/browser
+          npm init -y >/dev/null 2>&1
+          npm install playwright@1.55.0 >/dev/null
+          npx playwright install --with-deps chromium >/dev/null
+          cat > e2e.js <<'NODE'
+          const { chromium } = require('playwright');
+          (async () => {
+            const browser = await chromium.launch({headless:true});
+            const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+            const errors=[];
+            page.on('console', m => { if(m.type()==='error') errors.push(m.text()); });
+            page.on('pageerror', e => errors.push(e.message));
+            await page.goto('http://127.0.0.1:3000', {waitUntil:'networkidle'});
+            await page.getByRole('heading', {name:/Find the right exercise/i}).waitFor();
+            await page.getByLabel('Search exercises').fill('bench press');
+            await page.waitForTimeout(500);
+            await page.getByRole('link', {name:/Barbell Bench Press/i}).click();
+            await page.waitForLoadState('networkidle');
+            await page.getByRole('heading', {name:'Barbell Bench Press'}).waitFor();
+            await page.goto('http://127.0.0.1:3000/login', {waitUntil:'networkidle'});
+            await page.getByRole('button', {name:/Sign in to admin/i}).click();
+            await page.waitForURL('**/admin');
+            await page.getByText('Overview', {exact:true}).waitFor();
+            await page.goto('http://127.0.0.1:3000/admin/exercises', {waitUntil:'networkidle'});
+            await page.getByText('Exercises', {exact:true}).first().waitFor();
+            if (errors.length) throw new Error('Browser console/page errors: '+errors.join(' | '));
+            await browser.close();
+          })().catch(e=>{console.error(e);process.exit(1)});
+          NODE
+          node e2e.js
+      - name: Logs on failure
+        if: failure()
+        run: |
+          echo '--- BACKEND LOG ---'; cat /tmp/backend.log || true
+          echo '--- FRONTEND LOG ---'; cat /tmp/frontend.log || true
